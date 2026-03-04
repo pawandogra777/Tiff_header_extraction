@@ -1,0 +1,1956 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Nov 19 21:26:52 2025
+
+@author: AAG040825
+"""
+
+#########THIS IS FINLA##########################
+####################this is updated#################
+"""
+Created on Fri Sep 12 04:41:07 2025
+
+@author: sbs190623
+"""
+
+####synonyms fisrt #################################
+############thiss is for past medical histort in the content then we check #####
+###########this i s good ########################################
+from joblib import Parallel, delayed
+from tqdm import tqdm
+import traceback
+from PIL import Image, ImageSequence
+import pandas as pd
+import cv2
+import numpy as np
+import re
+from doctr.models import ocr_predictor
+from pymongo import MongoClient
+import time
+from datetime import datetime
+import os,sys
+import shutil
+from DataExtraction.Utility.VisitDateFormat import ConvertToNormalizedDOS
+from DataExtraction.Utility.VisitTypeFormat import normalize_visit_type
+from ChartMasterManager.LoadChratMaster import LoadChartInChartMaster
+import gc
+import torch
+
+mongoURI = "mongodb://172.19.19.80:27017/"
+# Parameters
+stopwords = {'HGB', 'Printed:', 'Details:', 'vital', 'Vital'}
+line_tolerance = 5
+gap_threshold = 1000
+col_gap_threshold = 80
+
+# Excel se headers + synonyms load karna
+def load_headers_from_excel(excel_path: str):
+    df = pd.read_excel(excel_path)
+    headers = []
+    for cell in df['header'].dropna().tolist():
+        # split by comma, strip extra spaces
+        parts = [p.strip() for p in str(cell).split(",") if p.strip()]
+        headers.extend(parts)
+    return headers
+
+def is_full_table_page(data, page_height, word_count_thresh=10000, std_left_thresh=437):
+    data_filtered = data[data['top'] > 0]
+    return len(data_filtered) < word_count_thresh and data_filtered['left'].std() > std_left_thresh
+
+def parse_table_lines_from_data(data, col_gap_threshold=80, line_tolerance=5):
+    data = data.reset_index(drop=True)
+    corrected_line_nums = []
+    current_line_num = 1
+    prev_top = None
+    for _, row in data.iterrows():
+        curr_top = row['top']
+        if prev_top is None or abs(curr_top - prev_top) > line_tolerance:
+            current_line_num += 1
+        corrected_line_nums.append(current_line_num)
+        prev_top = curr_top
+    data['corrected_line_num'] = corrected_line_nums
+
+    table_rows = []
+    grouped = data.groupby('corrected_line_num')
+    for _, group in grouped:
+        words = group.reset_index(drop=True)
+        row = []
+        prev_left = None
+        cell = ""
+        for _, word_row in words.iterrows():
+            curr_left = word_row['left']
+            word = word_row['text']
+            if prev_left is not None and (curr_left - prev_left) > col_gap_threshold:
+                row.append(cell.strip())
+                cell = word
+            else:
+                cell += " " + word if cell else word
+            prev_left = curr_left
+        if cell:
+            row.append(cell.strip())
+        table_rows.append(row)
+    return table_rows
+
+def normalize_header_for_regex(header: str) -> str:
+    header = header.strip()
+    header = re.sub(r"&", r"(?:&\.?|and)", header, flags=re.IGNORECASE)
+    header = re.sub(r"\s+", r"\\s+", header)
+    return header
+
+# Naya extract_sections_dynamic
+def extract_sections_dynamic(text: str, headers: list[str]) -> list[dict]:
+    matches = []
+    lines=text.splitlines()
+    new_lines=[]
+    for line in lines:
+        fixed=False
+        for h in headers:
+            synonyms=[syn.strip() for syn in h.split(",") if syn.strip()]
+            for syn in synonyms:
+                syn_text=syn.strip()
+                if line.lower().startswith(syn_text.lower()+ ":") and line.strip() != syn_text + ":":
+                    header_part=syn_text
+                    rest_part=line[len(syn_text)+1:].strip()
+                    new_lines.append(header_part)
+                    if rest_part:
+                        new_lines.append(rest_part)
+                    fixed= True
+                    break
+            if fixed:
+                break
+        if not fixed:
+            new_lines.append(line)          
+    lines=new_lines
+    # char_offset=0
+    # window_size=3
+    # i=0
+    # max_head_len=5
+    # while i<len(lines):
+    #     for w in range(1,window_size+1):
+    #         if i+w>len(lines):
+    #             continue
+    #         merged_lines=" ".join([lines[j].strip() for j in range(i,i+w)]) 
+    #         for h in headers:
+    #             synonyms=[syn.strip() for syn in h.split(",") if syn.strip()]
+    #             matched= False
+    #             for syn in synonyms:
+    #                 pattern = normalize_header_for_regex(syn)
+    #                 # line_text=lines[i].strip().lower()
+    #                 # syn_text=syn.strip().lower()
+    #                 # line_words=line_text.split()
+    #                 # if not line_text.startswith(syn_text) or len(line_words) > max_head_len:
+    #                 #     continue
+    #                 line_text=merged_lines.strip().lower()
+    #                 syn_text=syn.strip().lower()
+    #                 line_words=line_text.split()
+    #                 if not line_text.startswith(syn_text) or len(line_words) > max_head_len:
+    #                     continue
+    #                 # first_word=syn.strip().split()[0]
+    #                 # first_line_word=lines[i].strip().split()[0] if lines[i].strip() else ""
+    #                 # if first_word.lower() !=first_line_word.lower():
+    #                 #     continue
+                    
+    #                 pattern=r"^"+pattern+r"\b"
+    #                 if re.match(pattern,merged_lines, re.IGNORECASE):
+    #                     start_idx=char_offset
+    #                     end_idx=char_offset+sum(len(lines[i+k])+1 for k in range(w))
+    #                     matches.append((start_idx, end_idx, synonyms[0]))
+    #                     matched=True
+    #                     break
+    #             if matched:
+    #                 break
+    #         if matched:
+    #             break
+    #     char_offset+=len(lines[i])+1
+    #     i+=1
+
+    char_offset = 0
+    window_size = 3
+    i = 0
+    max_head_len = 5
+    matches = []
+
+    while i < len(lines):
+        matched = False
+        matched_window = 1
+
+        for w in range(1, window_size + 1):
+            if i + w > len(lines):
+                break
+
+            # Merge OCR-split lines
+            merged_lines = " ".join(lines[j].strip() for j in range(i, i + w))
+            merged_lines = re.sub(r"\s+", " ", merged_lines).strip()
+
+            # STRICT RULE: Entire merged line must have <= max_head_len words
+            # line_word_count = len(merged_lines.split())
+            # if line_word_count > max_head_len:
+            #     continue
+
+            for h in headers:
+                synonyms = [syn.strip() for syn in h.split(",") if syn.strip()]
+
+                for syn in synonyms:
+                    # ? Dynamic allowed length per header
+                    syn_word_len = len(syn.strip().split())
+                    allowed_len = max(max_head_len, syn_word_len + 2)
+
+                    line_word_count = len(merged_lines.split())
+                    if line_word_count > allowed_len:
+                        continue
+
+                    pattern = r"^" + normalize_header_for_regex(syn) + r"\b"
+
+                    match_obj = re.match(pattern, merged_lines, re.IGNORECASE)
+
+                    if match_obj:
+                        start_idx = char_offset
+                        header_end_relative = match_obj.end()
+                        end_idx = char_offset + header_end_relative
+
+                        matches.append((start_idx, end_idx, synonyms[0]))
+
+                        matched = True
+                        matched_window = w
+                        break
+
+                if matched:
+                    break
+            if matched:
+                break
+
+        # Move index correctly
+        if matched:
+            for k in range(matched_window):
+                char_offset += len(lines[i + k]) + 1
+            i += matched_window
+        else:
+            char_offset += len(lines[i]) + 1
+            i += 1
+
+                        
+
+    if not matches:
+        return []
+
+    matches.sort(key=lambda x: x[0])
+
+    extracted = []
+    for i, (start_idx, end_idx, header) in enumerate(matches):
+        if i ==0:
+            Firstcontent = text[0:start_idx].strip()
+            extracted.append({
+                "section": "BeforeFirstHeader",
+                "content": Firstcontent
+            })
+        if i + 1 < len(matches):
+            next_start_idx = matches[i + 1][0]
+            content = text[end_idx:next_start_idx].strip()
+            extracted.append({
+                "section": header,
+                "content": content
+            })
+        else:
+            content = text[end_idx:].strip()
+            extracted.append({
+                "section": f"{header}",
+                "content": content
+            })
+
+    return extracted
+
+def extract_sections_dynamic_beforeFeb26(text: str, headers: list[str]) -> list[dict]:
+    matches = []
+    lines=text.splitlines()
+    new_lines=[]
+    for line in lines:
+        fixed=False
+        for h in headers:
+            synonyms=[syn.strip() for syn in h.split(",") if syn.strip()]
+            for syn in synonyms:
+                syn_text=syn.strip()
+                if line.lower().startswith(syn_text.lower()+ ":") and line.strip() != syn_text + ":":
+                    header_part=syn_text
+                    rest_part=line[len(syn_text)+1:].strip()
+                    new_lines.append(header_part)
+                    if rest_part:
+                        new_lines.append(rest_part)
+                    fixed= True
+                    break
+            if fixed:
+                break
+        if not fixed:
+            new_lines.append(line)          
+    lines=new_lines
+    char_offset=0
+    window_size=3
+    i=0
+    max_head_len=5
+    while i<len(lines):
+        for w in range(1,window_size+1):
+            if i+w>len(lines):
+                continue
+            merged_lines=" ".join([lines[j].strip() for j in range(i,i+w)]) 
+            for h in headers:
+                synonyms=[syn.strip() for syn in h.split(",") if syn.strip()]
+                matched= False
+                for syn in synonyms:
+                    pattern = normalize_header_for_regex(syn)
+                    # line_text=lines[i].strip().lower()
+                    # syn_text=syn.strip().lower()
+                    # line_words=line_text.split()
+                    # if not line_text.startswith(syn_text) or len(line_words) > max_head_len:
+                    #     continue
+                    line_text=merged_lines.strip().lower()
+                    syn_text=syn.strip().lower()
+                    line_words=line_text.split()
+                    if not line_text.startswith(syn_text) or len(line_words) > max_head_len:
+                        continue
+                    # first_word=syn.strip().split()[0]
+                    # first_line_word=lines[i].strip().split()[0] if lines[i].strip() else ""
+                    # if first_word.lower() !=first_line_word.lower():
+                    #     continue
+                    
+                    pattern=r"^"+pattern+r"\b"
+                    if re.match(pattern,merged_lines, re.IGNORECASE):
+                        start_idx=char_offset
+                        end_idx=char_offset+sum(len(lines[i+k])+1 for k in range(w))
+                        matches.append((start_idx, end_idx, synonyms[0]))
+                        matched=True
+                        break
+                if matched:
+                    break
+            if matched:
+                break
+        char_offset+=len(lines[i])+1
+        i+=1
+                        
+
+    if not matches:
+        return []
+
+    matches.sort(key=lambda x: x[0])
+
+    extracted = []
+    for i, (start_idx, end_idx, header) in enumerate(matches):
+        if i + 1 < len(matches):
+            next_start_idx = matches[i + 1][0]
+            content = text[end_idx:next_start_idx].strip()
+            extracted.append({
+                "section": header,
+                "content": content
+            })
+        else:
+            content = text[end_idx:].strip()
+            extracted.append({
+                "section": f"{header}",
+                "content": content
+            })
+
+    return extracted
+
+
+
+def get_Page_Starts(final_text):
+    page_pattern = re.compile(r'\n\s*---\s*Page\s+\d+.*?---\s*\n')
+
+    page_starts = [0]  # Page 1 starts at index 0
+
+    for match in page_pattern.finditer(final_text):
+        page_starts.append(match.end())
+    return page_starts
+
+def extract_date_visit_sections(final_text: str):
+    # date_pattern = re.compile(
+    # r"Date\s*of\s*Service\s*:?\s*"
+    # r"(?P<date>\d{1,2}/\d{1,2}/\d{2,4})"    # date part
+    # r"(?:\s*Status\s*:\s*\w+)?\s*"          # optional 'Status: Signed'
+    # r"\n?\s*(?P<time>\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM)?)",  # time on same or next line
+    # flags=re.IGNORECASE
+    # )
+
+    date_pattern = re.compile(
+        r"(?:REP\s*SRV\s*DT\s*[:,]?\s*"     # 'REP SRV DT', optional ':' or ',' 
+        r"(?:\n\s*)?"                        # optional newline before date
+        r"|(?:\d+\.\s*)?DATE\s*OF\s*SERVICE\s*[:,]?\s*)"  # optional '1.' or any number followed by 'DATE OF SERVICE'
+        r"(?P<date>\d{1,2}/\d{1,2}/\d{2,4})",   # the date
+        flags=re.IGNORECASE
+    )
+
+    visit_pattern = re.compile(
+        r"\b(H\s*&\s*[A-Z]*P|History\s*&\s*Physical|History\s*and\s*Physical|Discharge\s*Summary|Procedure?|Progress\s*Notes?|Consultation?|Consults?)\b",
+        flags=re.IGNORECASE
+    )
+    end_pattern = re.compile(
+        r"END\s*[O0]\s*F\s*REPORT",   # clean + OCR variants
+        flags=re.IGNORECASE
+    )
+    page_pattern = re.compile(r"---\s*Page\s+(\d+)\s*\(.*?\)\s*---", flags=re.IGNORECASE)
+
+    words = final_text.split()
+    sections = {}
+    matches = []
+    page_Start_Index_list = get_Page_Starts(final_text)
+    # find all date occurrences
+    for m in date_pattern.finditer(final_text):
+        date_str = m.group("date")
+
+        # ---- FIXED (do NOT break logic, just avoid crash) ----
+        time_str = m.groupdict().get("time", "")
+        if time_str:
+            time_str = time_str.replace("\n", " ").strip()
+            full_datetime = f"{date_str}_{time_str}"
+        else:
+            full_datetime = date_str
+        # -------------------------------------------------------
+
+        start_idx = m.start()
+        word_index = len(final_text[:start_idx].split())
+        matches.append({
+            "datetime": full_datetime,
+            "word_index": word_index,
+            "char_index": start_idx
+        })
+
+    if not matches:
+        return {}
+
+    section = {}
+    header_count = {}
+
+    for i, m in enumerate(matches):
+        if not all(k in m for k in ("char_index", "datetime", "word_index")):
+            continue
+
+        full_datetime = m["datetime"]
+        word_index = m["word_index"]
+
+        # nearest visit type
+        nearest_visit = None
+        nearest_visit_idx = None
+        for vm in visit_pattern.finditer(final_text):
+            v_word_idx = len(final_text[:vm.start()].split())
+            if abs(v_word_idx - word_index) <= 60:
+                nearest_visit = vm.group(0).strip()
+                nearest_visit_idx = vm.start()
+                break
+
+        if not nearest_visit:
+            continue
+
+        start = m["char_index"]
+
+        # default end = next date
+        if i + 1 < len(matches):
+            end = matches[i + 1]["char_index"]
+        else:
+            end = len(final_text)
+
+        # check for "Care Timeline"
+        search_area = final_text[start:end]
+
+        # page detection BEFORE "Care Timeline"
+        page_match = page_pattern.search(search_area)
+        if page_match:
+            page_no = page_match.group(1)
+        else:
+            page_no = "Unknown"
+
+        # truncate at "Care Timeline" if present
+        end_match = end_pattern.search(search_area)
+        if end_match:
+            end = start + end_match.start()
+
+        section_text = final_text[start:end].strip()
+        
+
+        try:
+            page_no_int = int(page_no)
+            page_no_final = page_no_int - 1
+        except (ValueError, TypeError):
+            page_no_final = "Unknown"
+            continue
+
+        if page_no_final >=0 :
+            page_start_index = page_Start_Index_list[page_no_final]
+            if page_no_final > 0:
+                page_start_index = page_Start_Index_list[page_no_final]
+            if page_start_index > start:
+                page_start_index = start
+            
+            section_text = final_text[page_start_index:end].strip()
+        else:
+            continue 
+        section_text = remove_chunk_data_AHFL(section_text)
+        if not section_text:
+            continue
+        full_datetime_updated = ConvertToNormalizedDOS(full_datetime)
+        nearest_visit_Uniform= normalize_visit_type(nearest_visit.replace(' ', '_'))
+        base_header = (
+            f"DateOfService_{full_datetime_updated}_"
+            f"{nearest_visit_Uniform}_"
+            f"Page_{page_no_final}"
+        )
+
+        count = header_count.get(base_header, 0)
+        header_count[base_header] = count + 1
+
+        header_name = f"{base_header}"
+        sections[header_name] = section_text
+
+    return sections
+
+# def extract_date_visit_sections2(final_text: str):
+#     # date_pattern = re.compile(
+#     # r"Date\s*of\s*Service\s*:?\s*"
+#     # r"(?P<date>\d{1,2}/\d{1,2}/\d{2,4})"    # date part
+#     # r"(?:\s*Status\s*:\s*\w+)?\s*"          # optional 'Status: Signed'
+#     # r"\n?\s*(?P<time>\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM)?)",  # time on same or next line
+#     # flags=re.IGNORECASE
+#     # )
+#     date_pattern = re.compile(
+#         r"DATE\s*:\s*(?P<date>\d{1,2}/\d{1,2}/\d{2,4})\s*,?\s*"
+#         r"(?:\n\s*)?"
+#         r"TIME\s*:\s*(?P<time>\d{4})",
+#         flags=re.IGNORECASE
+#     )
+
+
+#     # date_pattern = re.compile(
+#     #     r"Date\s*of\s*Service\s*:?\s*\n?\s*"
+#     #     r"(\d{1,2}/\d{1,2}/\d{2,4}(?:\s+\d{1,2}:\d{2}(?::\d{2})?[\s\n]*(?:AM|PM)?)?)",
+#     #     flags=re.IGNORECASE
+#     # )
+#     visit_pattern = re.compile(
+#         r"\b(H\s*&\s*[A-Z]*P|History\s*&\s*Physical|Discharge\s*Summary|Progress\s*Notes?|Consults?)\b",
+#         flags=re.IGNORECASE
+#     )
+#     end_pattern = re.compile(
+#         r"(Care\s+Timeline)",
+#         flags=re.IGNORECASE
+#     )
+#     page_pattern = re.compile(r"---\s*Page\s+(\d+)\s*\(.*?\)\s*---", flags=re.IGNORECASE)
+
+#     words = final_text.split()
+#     sections = {}
+#     matches = []
+
+#     # find all date of service occurrences
+#     # for m in date_pattern.finditer(final_text):
+#     #     date_str = m.group(1)
+#     #     start_idx = m.start()
+#     #     word_index = len(final_text[:start_idx].split())
+#     #     matches.append({
+#     #         "date": date_str,
+#     #         "word_index": word_index,
+#     #         "char_index": start_idx
+#     #     })
+#         # find all date of service occurrences
+#     # print("date_pattern",date_pattern)
+#     for m in date_pattern.finditer(final_text):
+#         date_str = m.group("date")
+#         # time_str = m.group("time")
+#         time_str = m.group("time").replace("\n", " ").strip() 
+#         print("time_str",time_str)
+#         full_datetime=f"{date_str}_{time_str}"
+#         start_idx=m.start()
+#         word_index = len(final_text[:start_idx].split())
+#         matches.append({
+#             "datetime": full_datetime,
+#             "word_index": word_index,
+#             "char_index": start_idx
+#         })
+
+#     if not matches:
+#         return {}
+#     section={}
+#     header_count={}
+#     for i, m in enumerate(matches):
+#         if not all(k in m for k in ("char_index","datetime","word_index")):
+#             continue
+#         full_datetime = m["datetime"]
+#         word_index = m["word_index"]
+
+#         # nearest visit type
+#         nearest_visit = None
+#         nearest_visit_idx = None
+#         for vm in visit_pattern.finditer(final_text):
+#             v_word_idx = len(final_text[:vm.start()].split())
+#             if abs(v_word_idx - word_index) <= 50:
+#                 nearest_visit = vm.group(0).strip()
+#                 nearest_visit_idx = vm.start()
+#                 break
+
+#         if not nearest_visit:
+#             continue
+
+#         start = m["char_index"]
+
+#         # default end = next date
+#         if i + 1 < len(matches):
+#             end = matches[i + 1]["char_index"]
+#         else:
+#             end = len(final_text)
+
+#         # check for "Electronically signed by" or "Care Timeline" between start and end
+#         search_area = final_text[start:end]
+#         # ? STEP 1: Find page number *before* truncating by Care Timeline
+#         page_match = page_pattern.search(search_area)
+#         if page_match:
+#             page_no = page_match.group(1)
+#         else:
+#             page_no = "Unknown"
+
+#         # ? STEP 2: Now check for "Care Timeline" and truncate after
+#         end_match = end_pattern.search(search_area)
+        
+#         if end_match:
+#             end = start + end_match.start()
+
+#         section_text = final_text[start:end].strip()
+#         section_text = remove_chunk_data_AHFL(section_text)
+#         try:
+#             page_no_int = int(page_no)
+#             page_no_final = page_no_int - 1
+#         except (ValueError, TypeError):
+#             page_no_final = "Unknown"        
+#         if not section_text:
+#             continue
+#         base_header=f"Date_of_Service_{full_datetime}_{nearest_visit.replace(' ', '_')}_Page_{page_no_final}"
+#         count=header_count.get(base_header,0)
+#         header_count[base_header]=count+1
+#         header_name = f"{base_header}"
+#         sections[header_name] = section_text
+
+#     return sections
+def remove_chunk_data_AHFL(chart):
+    # Common footer/header strings and PHI indicators
+    chart = chart.replace("https://carelink.adventhealth.com/EpicCareLink-PRD/common/epic_main.asp", "")
+    chart = chart.replace("htpslIcarelinkadventhealth.com/EpicCareLink-PRDIcommonlepic_main.asp 2/11", "")
+    
+    # Patterns to remove
+    remove_patterns = [
+        r"---\s*PAGE\s*\d+\s*---",                        # Matches page headers like --- PAGE 6 ---
+        r"\d+/\d+/\d{2,4}, \d+:\d+ (AM|PM)",              # Timestamps like 10/9/24, 3:40 AM
+        r"Printed by.*",                                  # Footer like Printed by ROJA
+        r"User name.*",
+        r"User ID.*",
+        r"Patient MRN.*",
+        r"Patient name.*",
+        r"Date of Birth.*",
+        r"MRN.*",
+        r"DOB.*",
+        r"ht.*carelink.*",                                # Any variation of carelink URLs
+        r"^\s*name\s*$",                                  # Lines with just "name"
+        r"^\s*\d+/\d+\s*$"                                # Lines like "2/11"
+    ]
+
+    combined_pattern = re.compile("|".join(remove_patterns), re.IGNORECASE)
+
+    # Remove all lines matching the pattern
+    cleaned_lines = [line for line in chart.splitlines() if not combined_pattern.search(line)]
+    cleaned_chart = "\n".join(cleaned_lines)
+
+    return cleaned_chart
+
+def multi_page_tif_ocr_and_section_extract_extra(tif_path, medFolder,
+                                           target_pages=None,
+                                           headers=None,
+                                           final_text=None):
+
+    if final_text is None:
+
+        import torch
+        import gc
+
+        ocr_model = ocr_predictor(pretrained=True)
+
+        img_seq = Image.open(tif_path)
+        total_pages = img_seq.n_frames
+
+        if target_pages is None:
+            target_pages = list(range(total_pages))
+
+        batch_size = 50  # safer memory balance
+        resize_size = (1400, 1744)
+
+        doctr_pages = []
+        chart_pages = []
+        medicine_inx = []
+
+        checklist = ['medication orders', 'last mar event', 'dose/volume']
+
+        # ---------------- BATCH OCR ----------------
+        for i in range(0, len(target_pages), batch_size):
+
+            batch_indices = target_pages[i:i + batch_size]
+            batch_np = []
+
+            for page_idx in batch_indices:
+                img_seq.seek(page_idx)
+                page = img_seq.convert("RGB")
+                page = page.resize(resize_size, Image.LANCZOS)
+                batch_np.append(np.array(page))
+
+            with torch.no_grad():
+                result = ocr_model(batch_np)
+
+            doctr_pages.extend(result.pages)
+
+            del batch_np
+            del result
+            gc.collect()
+
+        # ------------------------------------------
+
+        accumulated_col1, accumulated_col2 = [], []
+
+        # ------------ PAGE PROCESSING -------------
+        for local_idx, doctr_page in enumerate(doctr_pages):
+
+            page_num = target_pages[local_idx]
+
+            img_seq.seek(page_num)
+            img = img_seq.convert("RGB")
+            width, height = img.size
+
+            data_rows = []
+
+            for block in doctr_page.blocks:
+                for line in block.lines:
+                    for word in line.words:
+                        ((x_min, y_min), (x_max, y_max)) = word.geometry
+                        data_rows.append({
+                            'text': word.value,
+                            'left': int(x_min * width),
+                            'top': int(y_min * height)
+                        })
+
+            if not data_rows:
+                continue
+
+            data = pd.DataFrame(data_rows)
+
+            # ---------- TABLE PAGE ----------
+            if is_full_table_page(data, height):
+
+                if accumulated_col1 or accumulated_col2:
+                    combined = accumulated_col2 + accumulated_col1
+                    chart_pages.append(
+                        f"\n\n--- Columnar Block (before Page {page_num + 1}) ---\n"
+                        + "\n".join(combined)
+                    )
+                    accumulated_col1, accumulated_col2 = [], []
+
+                table_rows = parse_table_lines_from_data(
+                    data, col_gap_threshold, line_tolerance
+                )
+
+                lines = [" ".join(row) for row in table_rows]
+
+                page_text = (
+                    f"\n--- Page {page_num + 1} (Table Page) ---\n"
+                    + "\n".join(lines)
+                )
+
+                chart_pages.append(page_text)
+
+                # medicine detection
+                lower_p = page_text.lower()
+                if sum(w in lower_p for w in checklist) >= 2:
+                    base_filename = os.path.splitext(
+                        os.path.basename(tif_path)
+                    )[0]
+                    os.makedirs(medFolder, exist_ok=True)
+
+                    output_path = os.path.join(
+                        medFolder,
+                        f"{base_filename}_{page_num + 1}.tif"
+                    )
+
+                    img_seq.seek(page_num)
+                    original_page = img_seq.convert("RGB")
+                    original_page.save(output_path, "TIFF")
+
+            # ---------- COLUMNAR PAGE ----------
+            else:
+
+                data = data.sort_values("top").reset_index(drop=True)
+
+                current_line = 0
+                prev_top = None
+                line_nums = []
+
+                for top in data["top"]:
+                    if prev_top is None or abs(top - prev_top) > line_tolerance:
+                        current_line += 1
+                    line_nums.append(current_line)
+                    prev_top = top
+
+                data["line_num"] = line_nums
+
+                grouped = data.groupby("line_num")
+
+                for _, group in grouped:
+
+                    group = group.sort_values("left")
+
+                    words = group["text"].tolist()
+                    line_text = " ".join(words)
+
+                    accumulated_col1.append(line_text.strip())
+
+                if accumulated_col1 or accumulated_col2:
+                    combined = accumulated_col2 + accumulated_col1
+
+                    page_text = (
+                        f"\n\n--- Page {page_num + 1} (Columnar Page) ---\n"
+                        + "\n".join(combined)
+                    )
+
+                    chart_pages.append(page_text)
+
+                    lower_p = page_text.lower()
+                    if sum(w in lower_p for w in checklist) >= 2:
+
+                        base_filename = os.path.splitext(
+                            os.path.basename(tif_path)
+                        )[0]
+                        os.makedirs(medFolder, exist_ok=True)
+
+                        output_path = os.path.join(
+                            medFolder,
+                            f"{base_filename}_{page_num + 1}.tif"
+                        )
+
+                        img_seq.seek(page_num)
+                        original_page = img_seq.convert("RGB")
+                        original_page.save(output_path, "TIFF")
+
+                    accumulated_col1, accumulated_col2 = [], []
+
+        # Cleanup
+        del doctr_pages
+        gc.collect()
+        img_seq.close()
+
+        final_text = "\n".join(chart_pages)
+
+    # -------- SECTION EXTRACTION --------
+    date_visit_sections = extract_date_visit_sections(final_text)
+
+    sections = {}
+    for dv_header, dv_text in date_visit_sections.items():
+        sections[dv_header] = extract_sections_dynamic(dv_text, headers)
+
+    return {"headers": sections,
+            "date_visit_sections": date_visit_sections}, final_text
+
+from itertools import islice
+
+def multi_page_tif_ocr_and_section_extract_half(tif_path, medFolder, target_pages=None, headers=None, final_text=None):
+    batch_size=800
+    if final_text is None:
+        ocr_model = ocr_predictor(pretrained=True)
+        img_seq = Image.open(tif_path)
+        total_pages = len(list(ImageSequence.Iterator(img_seq)))
+        print(f"Total pages: {total_pages}")
+
+        if target_pages is None:
+            target_pages = list(range(total_pages))
+
+        chart_pages = []
+        medicine_inx = []
+
+        # Batch-wise processing
+        for batch_start in range(0, len(target_pages), batch_size):
+            batch_end = min(batch_start + batch_size, len(target_pages))
+            batch_indices = target_pages[batch_start:batch_end]
+
+            print(f"Processing pages {batch_indices[0]+1} to {batch_indices[-1]+1} ...")
+
+            # Load batch pages only
+            batch_pages_pil = [
+                p.convert("RGB") for idx, p in enumerate(ImageSequence.Iterator(img_seq))
+                if idx in batch_indices
+            ]
+
+            # OCR in parallel
+            def process_page(page):
+                page = page.resize((1250,1544), Image.LANCZOS)
+                result = ocr_model([np.array(page)])
+                return page, result.pages[0]
+
+            pages_results = Parallel(n_jobs=14, backend="loky", verbose=10)(
+                delayed(process_page)(p) for p in batch_pages_pil
+            )
+
+            # Process OCR results per page
+            for local_idx, (img, doctr_page) in enumerate(pages_results):
+                page_num = batch_indices[local_idx]
+                width, height = img.size
+                img_np = np.array(img)
+                img_gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+
+                data_rows = []
+                for block in doctr_page.blocks:
+                    for line in block.lines:
+                        for word in line.words:
+                            ((x_min, y_min), (x_max, y_max)) = word.geometry
+                            left = int(x_min * width)
+                            top = int(y_min * height)
+                            data_rows.append({'text': word.value, 'left': left, 'top': top})
+                data = pd.DataFrame(data_rows)
+                if data.empty:
+                    continue
+                data = data.reset_index(drop=True)
+
+                # ------------------ Table / Column processing ------------------
+                if is_full_table_page(data, height):
+                    table_rows = parse_table_lines_from_data(data, col_gap_threshold, line_tolerance)
+                    lines = [" ".join(row) for row in table_rows]
+                    chart_pages.append(f"\n--- Page {page_num+1} (Table Page) ---\n" + "\n".join(lines))
+                else:
+                    # Columnar page processing logic (same as your original code)
+                    chart_lines_col1, chart_lines_col2 = [], []
+                    corrected_line_nums = []
+                    prev_top = None
+                    for _, row in data.iterrows():
+                        curr_top = row['top']
+                        current_line_num = corrected_line_nums[-1] + 1 if corrected_line_nums else 1
+                        if prev_top is not None and abs(curr_top - prev_top) <= line_tolerance:
+                            current_line_num -= 1
+                        corrected_line_nums.append(current_line_num)
+                        prev_top = curr_top
+                    data['corrected_line_num'] = corrected_line_nums
+                    # ... rest of your columnar logic to populate chart_pages ...
+
+                # ---------- Medication page saving ----------
+                checklist = ['medication orders','last mar event','dose/volume']
+                med_page = sum(check_w in chart_pages[-1].lower() for check_w in checklist)
+                if med_page >= 2:
+                    medicine_inx.append(page_num+1)
+                    base_filename = os.path.splitext(os.path.basename(tif_path))[0]
+                    os.makedirs(medFolder, exist_ok=True)
+                    output_path = os.path.join(medFolder, f"{base_filename}_{page_num + 1}.tif")
+                    batch_pages_pil[local_idx].save(output_path, "tiff")
+
+            # ------------------- Free memory -------------------
+            try:
+                del batch_pages_pil
+                del pages_results
+                gc.collect()
+            except:
+                pass
+
+        img_seq.close()
+        final_text = "\n".join(chart_pages)
+
+    # Extract sections as before
+    date_visit_sections = extract_date_visit_sections(final_text)
+    sections = {}
+    for dv_header, dv_text in date_visit_sections.items():
+        extracted_sections = extract_sections_dynamic(dv_text, headers)
+        sections[dv_header] = extracted_sections
+
+    return {"headers": sections, "date_visit_sections": date_visit_sections}, final_text
+
+import multiprocessing as mp
+
+ocr_model = None
+def init_worker():
+    global ocr_model
+    from doctr.models import ocr_predictor
+    ocr_model = ocr_predictor(pretrained=True)
+
+def process_page_outer(page):
+    global ocr_model
+    import numpy as np
+    from PIL import Image
+
+    page = page.resize((1250,1544), Image.LANCZOS)
+    result = ocr_model([np.array(page)])
+
+    return page, result.pages[0]
+threadCount = os.cpu_count() - 4
+def multi_page_tif_ocr_and_section_extract(tif_path, medFolder, target_pages=None, headers=None, final_text=None):
+    batch_size=200
+    if final_text is None:
+        ocr_model = ocr_predictor(pretrained=True)
+        img_seq = Image.open(tif_path)
+        total_pages = len(list(ImageSequence.Iterator(img_seq)))
+        print(f"Total pages: {total_pages}")
+
+        if target_pages is None:
+            target_pages = list(range(total_pages))
+
+        chart_pages = []
+        medicine_inx = []
+
+        # Batch-wise processing
+        for batch_start in range(0, len(target_pages), batch_size):
+            batch_end = min(batch_start + batch_size, len(target_pages))
+            batch_indices = target_pages[batch_start:batch_end]
+
+            print(f"Processing pages {batch_indices[0]+1} to {batch_indices[-1]+1} ...")
+
+            # Load batch pages only
+            batch_pages_pil = [
+                p.convert("RGB") for idx, p in enumerate(ImageSequence.Iterator(img_seq))
+                if idx in batch_indices
+            ]
+
+            # OCR in parallel
+            def process_page(page):
+                page = page.resize((1250,1544), Image.LANCZOS)
+                result = ocr_model([np.array(page)])
+                return page, result.pages[0]
+
+            pages_results = Parallel(n_jobs=threadCount, backend="loky", verbose=10)(
+                delayed(process_page)(p) for p in batch_pages_pil
+            )
+            
+            # Without loky but performance affected
+            # with mp.Pool(threadCount, initializer=init_worker) as pool:
+            #     pages_results = pool.map(process_page_outer, batch_pages_pil)
+
+            h_img, w_img = None, None
+            # chart_pages = []
+            accumulated_col1, accumulated_col2 = [], []
+            # medicine_inx = []
+
+            for local_idx, (img, doctr_page) in enumerate( pages_results):
+                page_num = batch_indices[local_idx]
+                width, height = img.size
+                img_np = np.array(img)
+                img_gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+
+                data_rows = []
+                for block in doctr_page.blocks:
+                    for line in block.lines:
+                        for word in line.words:
+                            ((x_min, y_min), (x_max, y_max)) = word.geometry
+                            left = int(x_min * width)
+                            top = int(y_min * height)
+                            data_rows.append({'text': word.value, 'left': left, 'top': top})
+                data = pd.DataFrame(data_rows)
+                if data.empty:
+                    continue
+                data = data.reset_index(drop=True)
+
+                if h_img is None or w_img is None:
+                    h_img, w_img = img_gray.shape
+
+                if is_full_table_page(data, height):
+                    print(f"Table detected on Page {page_num + 1}")
+                    if accumulated_col1 or accumulated_col2:
+                        combined = accumulated_col2 + accumulated_col1
+                        chart_pages.append(
+                            f"\n\n--- Columnar Block (before Page {page_num + 1}) ---\n" + "\n".join(combined)
+                        )
+                        accumulated_col1, accumulated_col2 = [], []
+
+                    table_rows = parse_table_lines_from_data(data, col_gap_threshold, line_tolerance)
+                    lines = [" ".join(row) for row in table_rows]
+                    p =f"\n--- Page {page_num + 1} (Table Page) ---\n" + "\n".join(lines)
+                    chart_pages.append(p)
+                    #--------------------------------------------------------------------------
+                    checklist = ['medication orders','last mar event','dose/volume']
+                    med_page = sum(check_w in p.lower() for check_w in checklist)
+                    if med_page >= 2:
+                        medicine_inx.append(page_num+1)
+                        base_filename = os.path.splitext(os.path.basename(tif_path))[0]
+                        save_fol = medFolder
+                        os.makedirs(save_fol, exist_ok=True)
+                        output_path = os.path.join(save_fol, f"{base_filename}_{page_num + 1}.tif")
+                        batch_pages_pil[local_idx].save(output_path, "tiff")
+
+
+                # ---------- CASE 2: COLUMNAR PAGE ----------
+                else:
+                    print(f"Columnar page detected on Page {page_num + 1}")
+                    corrected_line_nums = []
+                    current_line_num = 1
+                    prev_top = None
+                    for _, row in data.iterrows():
+                        curr_top = row['top']
+                        if prev_top is None or abs(curr_top - prev_top) > line_tolerance:
+                            current_line_num += 1
+                        corrected_line_nums.append(current_line_num)
+                        prev_top = curr_top
+                    data['corrected_line_num'] = corrected_line_nums
+
+                    chart_lines_col1, chart_lines_col2 = [], []
+                    grouped = data.groupby('corrected_line_num')
+
+                    for _, group in grouped:
+                        words = group.reset_index(drop=True)
+                        line_text = ""
+                        col2_text = ""
+                        prev_left = None
+                        first_left = words.loc[0, 'left']
+
+                        if first_left > 1315:
+                            for _, row in words.iterrows():
+                                line_text += (" " if line_text else "") + row['text']
+                        else:
+                            switched_to_col1 = False
+                            current_line = words['corrected_line_num'].iloc[0]
+                            for _, row in words.iterrows():
+                                curr_left = row['left']
+                                word = row['text']
+                                line_num = row['corrected_line_num']
+                                if not switched_to_col1:
+                                    if prev_left is not None and (curr_left - prev_left) > gap_threshold and curr_left > (width // 2):
+                                        switched_to_col1 = True
+                                        line_text += word
+                                    else:
+                                        col2_text += (" " if col2_text else "") + word
+                                else:
+                                    if line_num == current_line:
+                                        line_text += (" " if line_text else "") + word
+                                    else:
+                                        break
+                                prev_left = curr_left
+
+                        if line_text:
+                            for line in line_text.strip().split('\n'):
+                                accumulated_col1.append(line.strip())
+                        if col2_text:
+                            for line in col2_text.strip().split('\n'):
+                                accumulated_col2.append(line.strip())
+
+                    #  Append page number explicitly for columnar pages too
+                    if accumulated_col1 or accumulated_col2:
+                        combined = accumulated_col2 + accumulated_col1
+                        p =  f"\n\n--- Page {page_num + 1} (Columnar Page) ---\n" + "\n".join(combined)
+                        chart_pages.append(p)
+                        accumulated_col1, accumulated_col2 = [], []
+                        #--------------------------------------------------------------------------
+                        checklist = ['medication orders','last mar event','dose/volume']
+                        med_page = sum(check_w in p.lower() for check_w in checklist)
+                        if med_page >= 2:
+                            medicine_inx.append(page_num+1)
+                            base_filename = os.path.splitext(os.path.basename(tif_path))[0]
+                            save_fol = medFolder
+                            os.makedirs(save_fol, exist_ok=True)
+                            output_path = os.path.join(save_fol, f"{base_filename}_{page_num + 1}.tif")
+                            batch_pages_pil[local_idx].save(output_path, "tiff")
+            # ------------------- Free memory -------------------
+            try:
+                del batch_pages_pil
+                del pages_results
+                gc.collect()
+            except:
+                pass
+
+        img_seq.close()
+        final_text = "\n".join(chart_pages)
+
+    # Extract sections as before
+    date_visit_sections = extract_date_visit_sections(final_text)
+    sections = {}
+    for dv_header, dv_text in date_visit_sections.items():
+        extracted_sections = extract_sections_dynamic(dv_text, headers)
+        # sections[dv_header] = extracted_sections
+        if len(extracted_sections) == 0:
+            value = dv_header.split("_")[4]
+
+            extracted_sections=[]
+            content = dv_text[1:].strip()
+            extracted_sections.append({
+                    "section": value,
+                    "content": content
+                })
+            sections[dv_header] = extracted_sections
+        else:
+            sections[dv_header] = extracted_sections
+
+    return {"headers": sections, "date_visit_sections": date_visit_sections}, final_text
+def multi_page_tif_ocr_and_section_extract_lokyworkinginPython(tif_path, medFolder, target_pages=None, headers=None, final_text=None):
+    batch_size=200
+    if final_text is None:
+        ocr_model = ocr_predictor(pretrained=True)
+        img_seq = Image.open(tif_path)
+        total_pages = len(list(ImageSequence.Iterator(img_seq)))
+        print(f"Total pages: {total_pages}")
+
+        if target_pages is None:
+            target_pages = list(range(total_pages))
+
+        chart_pages = []
+        medicine_inx = []
+
+        # Batch-wise processing
+        for batch_start in range(0, len(target_pages), batch_size):
+            batch_end = min(batch_start + batch_size, len(target_pages))
+            batch_indices = target_pages[batch_start:batch_end]
+
+            print(f"Processing pages {batch_indices[0]+1} to {batch_indices[-1]+1} ...")
+
+            # Load batch pages only
+            batch_pages_pil = [
+                p.convert("RGB") for idx, p in enumerate(ImageSequence.Iterator(img_seq))
+                if idx in batch_indices
+            ]
+
+            # OCR in parallel
+            def process_page(page):
+                page = page.resize((1250,1544), Image.LANCZOS)
+                result = ocr_model([np.array(page)])
+                return page, result.pages[0]
+
+            pages_results = Parallel(n_jobs=threadCount, backend="loky", verbose=10)(
+                delayed(process_page)(p) for p in batch_pages_pil
+            )
+
+            h_img, w_img = None, None
+            # chart_pages = []
+            accumulated_col1, accumulated_col2 = [], []
+            # medicine_inx = []
+
+            for local_idx, (img, doctr_page) in enumerate( pages_results):
+                page_num = batch_indices[local_idx]
+                width, height = img.size
+                img_np = np.array(img)
+                img_gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+
+                data_rows = []
+                for block in doctr_page.blocks:
+                    for line in block.lines:
+                        for word in line.words:
+                            ((x_min, y_min), (x_max, y_max)) = word.geometry
+                            left = int(x_min * width)
+                            top = int(y_min * height)
+                            data_rows.append({'text': word.value, 'left': left, 'top': top})
+                data = pd.DataFrame(data_rows)
+                if data.empty:
+                    continue
+                data = data.reset_index(drop=True)
+
+                if h_img is None or w_img is None:
+                    h_img, w_img = img_gray.shape
+
+                if is_full_table_page(data, height):
+                    print(f"Table detected on Page {page_num + 1}")
+                    if accumulated_col1 or accumulated_col2:
+                        combined = accumulated_col2 + accumulated_col1
+                        chart_pages.append(
+                            f"\n\n--- Columnar Block (before Page {page_num + 1}) ---\n" + "\n".join(combined)
+                        )
+                        accumulated_col1, accumulated_col2 = [], []
+
+                    table_rows = parse_table_lines_from_data(data, col_gap_threshold, line_tolerance)
+                    lines = [" ".join(row) for row in table_rows]
+                    p =f"\n--- Page {page_num + 1} (Table Page) ---\n" + "\n".join(lines)
+                    chart_pages.append(p)
+                    #--------------------------------------------------------------------------
+                    checklist = ['medication orders','last mar event','dose/volume']
+                    med_page = sum(check_w in p.lower() for check_w in checklist)
+                    if med_page >= 2:
+                        medicine_inx.append(page_num+1)
+                        base_filename = os.path.splitext(os.path.basename(tif_path))[0]
+                        save_fol = medFolder
+                        os.makedirs(save_fol, exist_ok=True)
+                        output_path = os.path.join(save_fol, f"{base_filename}_{page_num + 1}.tif")
+                        batch_pages_pil[local_idx].save(output_path, "tiff")
+
+
+                # ---------- CASE 2: COLUMNAR PAGE ----------
+                else:
+                    print(f"Columnar page detected on Page {page_num + 1}")
+                    corrected_line_nums = []
+                    current_line_num = 1
+                    prev_top = None
+                    for _, row in data.iterrows():
+                        curr_top = row['top']
+                        if prev_top is None or abs(curr_top - prev_top) > line_tolerance:
+                            current_line_num += 1
+                        corrected_line_nums.append(current_line_num)
+                        prev_top = curr_top
+                    data['corrected_line_num'] = corrected_line_nums
+
+                    chart_lines_col1, chart_lines_col2 = [], []
+                    grouped = data.groupby('corrected_line_num')
+
+                    for _, group in grouped:
+                        words = group.reset_index(drop=True)
+                        line_text = ""
+                        col2_text = ""
+                        prev_left = None
+                        first_left = words.loc[0, 'left']
+
+                        if first_left > 1315:
+                            for _, row in words.iterrows():
+                                line_text += (" " if line_text else "") + row['text']
+                        else:
+                            switched_to_col1 = False
+                            current_line = words['corrected_line_num'].iloc[0]
+                            for _, row in words.iterrows():
+                                curr_left = row['left']
+                                word = row['text']
+                                line_num = row['corrected_line_num']
+                                if not switched_to_col1:
+                                    if prev_left is not None and (curr_left - prev_left) > gap_threshold and curr_left > (width // 2):
+                                        switched_to_col1 = True
+                                        line_text += word
+                                    else:
+                                        col2_text += (" " if col2_text else "") + word
+                                else:
+                                    if line_num == current_line:
+                                        line_text += (" " if line_text else "") + word
+                                    else:
+                                        break
+                                prev_left = curr_left
+
+                        if line_text:
+                            for line in line_text.strip().split('\n'):
+                                accumulated_col1.append(line.strip())
+                        if col2_text:
+                            for line in col2_text.strip().split('\n'):
+                                accumulated_col2.append(line.strip())
+
+                    #  Append page number explicitly for columnar pages too
+                    if accumulated_col1 or accumulated_col2:
+                        combined = accumulated_col2 + accumulated_col1
+                        p =  f"\n\n--- Page {page_num + 1} (Columnar Page) ---\n" + "\n".join(combined)
+                        chart_pages.append(p)
+                        accumulated_col1, accumulated_col2 = [], []
+                        #--------------------------------------------------------------------------
+                        checklist = ['medication orders','last mar event','dose/volume']
+                        med_page = sum(check_w in p.lower() for check_w in checklist)
+                        if med_page >= 2:
+                            medicine_inx.append(page_num+1)
+                            base_filename = os.path.splitext(os.path.basename(tif_path))[0]
+                            save_fol = medFolder
+                            os.makedirs(save_fol, exist_ok=True)
+                            output_path = os.path.join(save_fol, f"{base_filename}_{page_num + 1}.tif")
+                            batch_pages_pil[local_idx].save(output_path, "tiff")
+            # ------------------- Free memory -------------------
+            try:
+                del batch_pages_pil
+                del pages_results
+                gc.collect()
+            except:
+                pass
+
+        img_seq.close()
+        final_text = "\n".join(chart_pages)
+
+    # Extract sections as before
+    date_visit_sections = extract_date_visit_sections(final_text)
+    sections = {}
+    for dv_header, dv_text in date_visit_sections.items():
+        extracted_sections = extract_sections_dynamic(dv_text, headers)
+        sections[dv_header] = extracted_sections
+
+    return {"headers": sections, "date_visit_sections": date_visit_sections}, final_text
+def multi_page_tif_ocr_and_section_extract_paw(tif_path, medFolder,target_pages=None, headers=None,final_text = None):
+# def multi_page_tif_ocr_and_section_extract(tif_path, target_pages=None, headers=None):
+    if final_text == None:
+        import torch
+        # torch.set_num_threads(2)          # ? limit threads for this file
+        # torch.set_num_interop_threads(1)
+        
+
+        # pages_pil = [all_pages_pil[i] for i in target_pages]
+        # pages_pil=[p.resize((1400,1744),Image.LANCZOS) for p in pages_pil]
+        # pages_np = [np.array(p) for p in pages_pil]
+        # doctr_results = ocr_model(pages_np)
+        ocr_model = ocr_predictor(pretrained=True)
+        img_seq = Image.open(tif_path)
+        all_pages_pil=[p.convert("RGB") for p in ImageSequence.Iterator(img_seq)]
+        if target_pages is None:
+            target_pages = list(range(len(all_pages_pil)))
+        pages_pil=[all_pages_pil[i] for i in target_pages]
+    
+        # ---------------- OCR PER PAGE PARALLEL ----------------
+        def process_page(page):
+            page = page.resize((1250,1544), Image.LANCZOS)
+            result = ocr_model([np.array(page)])
+            return page, result.pages[0]
+
+        pages_results = Parallel(n_jobs=14, backend="loky", verbose=10)(
+            delayed(process_page)(p) for p in pages_pil
+        )
+
+
+        h_img, w_img = None, None
+        chart_pages = []
+        accumulated_col1, accumulated_col2 = [], []
+        medicine_inx = []
+
+        for local_idx, (img, doctr_page) in enumerate( pages_results):
+            page_num = target_pages[local_idx]
+            width, height = img.size
+            img_np = np.array(img)
+            img_gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+
+            data_rows = []
+            for block in doctr_page.blocks:
+                for line in block.lines:
+                    for word in line.words:
+                        ((x_min, y_min), (x_max, y_max)) = word.geometry
+                        left = int(x_min * width)
+                        top = int(y_min * height)
+                        data_rows.append({'text': word.value, 'left': left, 'top': top})
+            data = pd.DataFrame(data_rows)
+            if data.empty:
+                continue
+            data = data.reset_index(drop=True)
+
+            if h_img is None or w_img is None:
+                h_img, w_img = img_gray.shape
+
+            if is_full_table_page(data, height):
+                print(f"Table detected on Page {page_num + 1}")
+                if accumulated_col1 or accumulated_col2:
+                    combined = accumulated_col2 + accumulated_col1
+                    chart_pages.append(
+                        f"\n\n--- Columnar Block (before Page {page_num + 1}) ---\n" + "\n".join(combined)
+                    )
+                    accumulated_col1, accumulated_col2 = [], []
+
+                table_rows = parse_table_lines_from_data(data, col_gap_threshold, line_tolerance)
+                lines = [" ".join(row) for row in table_rows]
+                p =f"\n--- Page {page_num + 1} (Table Page) ---\n" + "\n".join(lines)
+                chart_pages.append(p)
+                #--------------------------------------------------------------------------
+                checklist = ['medication orders','last mar event','dose/volume']
+                med_page = sum(check_w in p.lower() for check_w in checklist)
+                if med_page >= 2:
+                    medicine_inx.append(page_num+1)
+                    base_filename = os.path.splitext(os.path.basename(tif_path))[0]
+                    save_fol = medFolder
+                    os.makedirs(save_fol, exist_ok=True)
+                    output_path = os.path.join(save_fol, f"{base_filename}_{page_num + 1}.tif")
+                    all_pages_pil[page_num].save(output_path, "tiff")
+
+
+            # ---------- CASE 2: COLUMNAR PAGE ----------
+            else:
+                print(f"Columnar page detected on Page {page_num + 1}")
+                corrected_line_nums = []
+                current_line_num = 1
+                prev_top = None
+                for _, row in data.iterrows():
+                    curr_top = row['top']
+                    if prev_top is None or abs(curr_top - prev_top) > line_tolerance:
+                        current_line_num += 1
+                    corrected_line_nums.append(current_line_num)
+                    prev_top = curr_top
+                data['corrected_line_num'] = corrected_line_nums
+
+                chart_lines_col1, chart_lines_col2 = [], []
+                grouped = data.groupby('corrected_line_num')
+
+                for _, group in grouped:
+                    words = group.reset_index(drop=True)
+                    line_text = ""
+                    col2_text = ""
+                    prev_left = None
+                    first_left = words.loc[0, 'left']
+
+                    if first_left > 1315:
+                        for _, row in words.iterrows():
+                            line_text += (" " if line_text else "") + row['text']
+                    else:
+                        switched_to_col1 = False
+                        current_line = words['corrected_line_num'].iloc[0]
+                        for _, row in words.iterrows():
+                            curr_left = row['left']
+                            word = row['text']
+                            line_num = row['corrected_line_num']
+                            if not switched_to_col1:
+                                if prev_left is not None and (curr_left - prev_left) > gap_threshold and curr_left > (width // 2):
+                                    switched_to_col1 = True
+                                    line_text += word
+                                else:
+                                    col2_text += (" " if col2_text else "") + word
+                            else:
+                                if line_num == current_line:
+                                    line_text += (" " if line_text else "") + word
+                                else:
+                                    break
+                            prev_left = curr_left
+
+                    if line_text:
+                        for line in line_text.strip().split('\n'):
+                            accumulated_col1.append(line.strip())
+                    if col2_text:
+                        for line in col2_text.strip().split('\n'):
+                            accumulated_col2.append(line.strip())
+
+                #  Append page number explicitly for columnar pages too
+                if accumulated_col1 or accumulated_col2:
+                    combined = accumulated_col2 + accumulated_col1
+                    p =  f"\n\n--- Page {page_num + 1} (Columnar Page) ---\n" + "\n".join(combined)
+                    chart_pages.append(p)
+                    accumulated_col1, accumulated_col2 = [], []
+                    #--------------------------------------------------------------------------
+                    checklist = ['medication orders','last mar event','dose/volume']
+                    med_page = sum(check_w in p.lower() for check_w in checklist)
+                    if med_page >= 2:
+                        medicine_inx.append(page_num+1)
+                        base_filename = os.path.splitext(os.path.basename(tif_path))[0]
+                        save_fol = medFolder
+                        os.makedirs(save_fol, exist_ok=True)
+                        output_path = os.path.join(save_fol, f"{base_filename}_{page_num + 1}.tif")
+                        all_pages_pil[page_num].save(output_path, "tiff")
+
+        # After loop
+        # del pages_pil
+        # del doctr_results.pages
+        # del doctr_results
+        # gc.collect()
+        # img_seq.close()
+        # final_text = "\n".join(chart_pages)
+            try:
+                del img
+                del doctr_page
+                del img_np
+                del img_gray
+                del data
+                del data_rows
+            except:
+                pass
+
+        gc.collect()
+        final_text = "\n".join(chart_pages)
+
+        # -------- FREE BIG OBJECTS --------
+        try:
+            del pages_results
+            del pages_pil
+            del all_pages_pil
+            del chart_pages
+            del accumulated_col1
+            del accumulated_col2
+            del medicine_inx
+        except:
+            pass
+
+        try:
+            del ocr_model
+        except:
+            pass
+
+        img_seq.close()
+
+        gc.collect()
+    # first_6_pages_text = "\n".join(chart_pages[:6])
+    # date_pattern = re.compile(r"Date\s*of\s*Service\s*:?", flags=re.IGNORECASE)
+    # creation_pattern = re.compile(r"(?:Creation\s*Time|Attested\s*Creation\s*Time|Documented(?:\s*on)?)\s*:?", flags=re.IGNORECASE)
+    # if creation_pattern.search(first_6_pages_text):
+    #     date_visit_sections = extract_date_visit_sections(final_text)
+    # else:
+    date_visit_sections = extract_date_visit_sections(final_text)
+
+    sections = {}
+    for dv_header, dv_text in date_visit_sections.items():
+        extracted_sections = extract_sections_dynamic(dv_text, headers)
+        sections[dv_header] = extracted_sections
+
+    # return {"headers": sections, "date_visit_sections": date_visit_sections}
+
+    return {"headers": sections, "date_visit_sections": date_visit_sections},final_text
+
+
+# excel_path = r"O:\From_DataScientists\Data Extraction\Main_Headers\LMC_Headers.xlsx"
+# headers = load_headers_from_excel(excel_path)
+# mongo_client = MongoClient("mongodb://172.19.19.80:27017/")
+# # db = mongo_client["try"]\
+# tif_folder = r"O:\FACILITY_SORTED\All Segregated\CCCC"
+# db = mongo_client["BS_NEW_CCCC_n"]
+# collection = db["charts_19_11_2025"]
+# collection2 = db["ocr_results"]
+# all_files =[f for f in os.listdir(tif_folder) if f.lower().endswith(".tif")]
+# selected_files = all_files
+
+# for file_name in selected_files:
+#     print(f'processing file {file_name}')
+#     tif_path = os.path.join(tif_folder, file_name)
+#     img_seq = Image.open(tif_path)
+#     total_pages = len(list(ImageSequence.Iterator(img_seq)))
+#     selected_pages = list(range(total_pages))
+#     start_time = time.time()
+#     document = collection2.find_one({'file_name': file_name})
+#     if document:
+#         final_text = document.get('ocr_text', None)
+#     else:
+#         final_text = None
+#     visits,final_text = multi_page_tif_ocr_and_section_extract(tif_path, selected_pages, headers, final_text)
+#     elapsed = time.time() - start_time
+#     print(f"Completed {file_name} in {elapsed:.2f} seconds")
+#     doc = {"file_name": file_name, "visits": {}}
+
+#     for visit_name, header_dict in visits["headers"].items():
+#         doc["visits"][visit_name] = header_dict
+#     collection.update_one(
+#         {"file_name":file_name},
+#         {"$set": doc},
+#         upsert=True
+#     )
+#     collection2.update_one(
+#         {"file_name": file_name},
+#         {"$set": {"ocr_text": final_text}},
+#         upsert=True
+#     )   
+
+#     print(f" data for {file_name} inserted into Mongodb\n")
+
+
+
+def process_file_parallels_1(tif_folder,file_name,chart_master_database_name,chart_master_coll_name,database_name,chart_db_name,chart_ocr_db_name,medFolder,headers,FacilityName,mongoURI):
+    
+  
+    try:      
+        
+            
+       
+        print("filename processing:",file_name )
+        mongo_client = MongoClient(mongoURI)
+      
+        db = mongo_client[database_name]
+        collection = db[chart_db_name]
+        collection2 = db[chart_ocr_db_name]
+        Start_datetime = datetime.now() 
+        tif_path = os.path.join(tif_folder, file_name)
+        # print("tif_path",tif_path, flush=True)
+        img_seq = Image.open(tif_path)
+        
+        total_pages = len(list(ImageSequence.Iterator(img_seq)))
+
+        # LoadChartInChartMaster(FacilityName,database_name,file_name,total_pages)
+
+        db3 = mongo_client[chart_master_database_name]        
+        collection3 = db3[chart_master_coll_name]
+        filter_query = {
+            "file_name": file_name
+        }
+
+        update_data = {
+            "$set": {
+                "ChartSplitStarted": Start_datetime,
+                "ChartHeaderExtractionStart": Start_datetime
+            }
+        }
+        collection3.update_one(filter_query, update_data)
+
+        selected_pages = list(range(total_pages))
+        start_time = time.time()
+        document = collection2.find_one({'file_name': file_name})
+        if document:
+            final_text = document.get('ocr_text', None)
+        else:
+            final_text = None
+        # visits = multi_page_tif_ocr_and_section_extract(tif_path, selected_pages, headers)
+        visits, final_text = multi_page_tif_ocr_and_section_extract(tif_path,medFolder, selected_pages, headers,final_text)
+    
+        doc = {"file_name": file_name, "visits": {}}
+        for visit_name, header_dict in visits["headers"].items():
+            doc["visits"][visit_name] = header_dict
+        
+        collection.update_one(
+            {"file_name":file_name},
+            {"$set": doc},
+            upsert=True
+        )
+        collection2.update_one(
+            {"file_name": file_name},
+            {"$set": {"ocr_text": final_text}},
+            upsert=True
+        )        
+
+        db3 = mongo_client[chart_master_database_name]        
+        collection3 = db3[chart_master_coll_name]
+        current_datetime = datetime.now()
+        filter_query = {
+            "file_name": file_name
+        }
+
+        update_data = {
+            "$set": {
+                "ChartSplitEnd": current_datetime,
+                "ChartHeaderExtractionEnd": current_datetime,
+                "MedicationPageExtraction": current_datetime
+            }
+        }
+        collection3.update_one(filter_query, update_data)
+
+
+        # collection.insert_one(doc)
+        print(f"Data for {file_name} inserted into MongoDB in {round(time.time() - start_time, 2)} sec\n")
+        img_seq.close()
+        processed_folder = tif_folder + "/" + "Processed" 
+        os.makedirs(processed_folder , exist_ok=True)
+        processed_path = os.path.join(processed_folder, file_name)
+        if os.path.exists(processed_path):
+            os.remove(processed_path)
+        shutil.move(tif_path, processed_folder)
+
+
+
+
+    except Exception as e:
+        print(f"Error processing file {file_name}: {str(e)}")
+        traceback.print_exc()
+
+def LoadImageFileInChartMaster(FacilityName,tif_folder,file_name,chart_master_database_name,chart_master_coll_name,mongoURI,tesseract_Path):
+    tif_path = os.path.join(tif_folder, file_name)
+    # print("tif_path",tif_path, flush=True)
+    img_seq = Image.open(tif_path)
+    total_pages = len(list(ImageSequence.Iterator(img_seq)))
+    LoadChartInChartMaster(FacilityName,chart_master_database_name,chart_master_coll_name,file_name,total_pages,mongoURI,tesseract_Path)
+    img_seq.close()
+
+
+def get_chart_list_from_chartmaster(
+        collection,        
+        file_process
+    ):
+    cursor = collection.find(
+        {
+           
+            "file_name":  {"$in": file_process}
+        },
+        {
+            "_id": 0,
+            "file_name": 1,
+            "pageCount": 1
+        }
+    )
+
+    return [
+        {"file": doc["file_name"], "pageCount": doc.get("pageCount", "0")}
+        for doc in cursor
+    ]
+
+
+def main(input_tiff_folder,
+                        medication_page_folder,
+                        facility_name,
+                        header_file_path,
+                        chart_master_database_name,
+                        chart_master_coll_name,
+                        database_name,
+                        chart_db_name,
+                        chart_ocr_db_name,
+                        parallel_process_count ,
+                        tesseract_Path,
+                        mongo_db_con_string):
+    print("=== MAIN DATA EXTRACTION STARTED ===")
+    mongoURI = mongo_db_con_string  
+    
+    FacilityName=facility_name
+    tif_folder=input_tiff_folder
+    database_name = database_name
+    chart_ocr_db_name=chart_ocr_db_name
+    chart_db_name = chart_db_name
+    parallel_process_count=parallel_process_count
+    excel_path = header_file_path
+    mdeFolder = medication_page_folder
+    # Main extraction logic
+    print(f"Processing TIFFs from {tif_folder}")
+    print(f"Saving charts to DB: {chart_db_name}")
+    stat_par = time.time()
+
+    print("Start Time: ", stat_par)  
+    
+    # tif_folder = r"O:\For_OCR\CHART_PROCESS\BCS"
+    # Load OCR model
+
+    # Run the function for all files
+    image_files = [f for f in os.listdir(tif_folder) if f.lower().endswith((".tiff", ".tif", ".png"))]
+    file_process=image_files
+    # selected_files=all_files[123:]
+    # excel_path = r"O:\From_DataScientists\From Pawan\Main_Headers\BCS_Headers.xlsx"
+    headers = load_headers_from_excel(excel_path)
+    mongo_client1 = MongoClient(mongoURI)
+    db = mongo_client1[database_name]
+    collection = db[chart_db_name]
+
+    existing_files = set(doc["file_name"] for doc in collection.find({}, {"file_name": 1, "_id": 0}))    
+    # Filter out files already inserted
+    file_process = [f for f in image_files if f not in existing_files]
+    for file_name in file_process:
+        LoadImageFileInChartMaster(FacilityName,tif_folder,file_name,chart_master_database_name,chart_master_coll_name,mongoURI,tesseract_Path)
+    # mdeFolder = r"C:\Users\nvd030406\Desktop\medication\BCS"
+    # results = Parallel(n_jobs=parallel_process_count)(
+    #     delayed(process_file_parallels_1)(tif_folder,file_name,chart_master_database_name,chart_master_coll_name,database_name, chart_db_name,chart_ocr_db_name,mdeFolder,headers,FacilityName) for file_name in tqdm(file_process, desc="Processing Images")
+     
+    # )
+    dbmaster = mongo_client1[chart_master_database_name]
+    collectionMaster = dbmaster[chart_master_coll_name]
+    chart_list = get_chart_list_from_chartmaster(
+            collectionMaster,            
+            file_process
+        )
+    
+    threadCount = parallel_process_count
+    for file_name in tqdm(file_process, desc="Processing Files Sequentially"):
+        result = process_file_parallels_1(tif_folder,file_name,
+                    chart_master_database_name,chart_master_coll_name,
+                    database_name, chart_db_name,chart_ocr_db_name,
+                    mdeFolder,headers,FacilityName,mongoURI)
+
+    # less_than_100 = [c["file"] for c in chart_list if int(c["pageCount"]) < 100]
+    # print (f"Chart Extraction for Charts:{len(less_than_100)} Start with less_than_100 page Loops.")
+    # results = Parallel(
+    #         n_jobs=parallel_process_count,
+    #         prefer="threads"   # ?? EXE-safe
+    #         )(
+    #             delayed(process_file_parallels_1)(
+    #                 tif_folder,file_name,
+    #                 chart_master_database_name,chart_master_coll_name,
+    #                 database_name, chart_db_name,chart_ocr_db_name,
+    #                 mdeFolder,headers,FacilityName,mongoURI
+    #             )
+    #             for file_name in less_than_100
+    #         )
+    # print (f"Chart Extraction for Charts:{len(less_than_100)} End with less_than_100 page Loops.")
+
+    # between_100_250 = [c["file"] for c in chart_list if 100 <= int(c["pageCount"]) <= 250]
+    # print (f"Chart Extraction for Charts:{len(between_100_250)} Start with between_100_250 page Loops.")
+    # results = Parallel(
+    #         n_jobs=2,
+    #         prefer="threads"   # ?? EXE-safe
+    #         )(
+    #             delayed(process_file_parallels_1)(
+    #                 tif_folder,file_name,
+    #                 chart_master_database_name,chart_master_coll_name,
+    #                 database_name, chart_db_name,chart_ocr_db_name,
+    #                 mdeFolder,headers,FacilityName,mongoURI
+    #             )
+    #             for file_name in between_100_250
+    #         )
+    # print (f"Chart Extraction for Charts:{len(between_100_250)} End with between_100_250 page Loops.")
+    
+    # above_250 = [c["file"] for c in chart_list if int(c["pageCount"]) > 250]
+    # print (f"Chart Extraction for Charts:{len(above_250)} Start with above_250 page Loops.")
+    # results = Parallel(
+    #         n_jobs=1,
+    #         prefer="threads"   # ?? EXE-safe
+    #         )(
+    #             delayed(process_file_parallels_1)(
+    #                 tif_folder,file_name,
+    #                 chart_master_database_name,chart_master_coll_name,
+    #                 database_name, chart_db_name,chart_ocr_db_name,
+    #                 mdeFolder,headers,FacilityName,mongoURI
+    #             )
+    #             for file_name in above_250
+    #         )
+    # print (f"Chart Extraction for Charts:{len(above_250)} End with above_250 page Loops.")
+    
+    # # print("results",results)
+
+    stop_time = time.time()
+    print("Time taken:", round((stop_time - stat_par), 3), "seconds")  
+
+
+
+def mainargs(args):
+    print("=== MAIN DATA EXTRACTION STARTED ===")
+
+    # Main extraction logic
+    print(f"Processing TIFFs from {args.input_tiff_folder}")
+    print(f"Saving charts to DB: {args.chart_db_name}")
+    FacilityName=args.facility_name
+    tif_folder=args.input_tiff_folder
+    database_name = args.database_name
+    chart_ocr_db_name=args.chart_ocr_db_name
+    chart_db_name = args.chart_db_name
+    parallel_process_count=args.parallel_process_count
+    excel_path = args.header_file_path
+    mdeFolder = args.medication_page_folder
+    stat_par = time.time()
+
+    print("Start Time: ", stat_par)  
+    
+    # tif_folder = r"O:\For_OCR\CHART_PROCESS\BCS"
+    # Load OCR model
+
+    # Run the function for all files
+    image_files = [f for f in os.listdir(tif_folder) if f.lower().endswith((".tiff", ".tif", ".png"))]
+    file_process=image_files
+    # selected_files=all_files[123:]
+    # excel_path = r"O:\From_DataScientists\From Pawan\Main_Headers\BCS_Headers.xlsx"
+    headers = load_headers_from_excel(excel_path)
+    mongo_client1 = MongoClient(mongoURI)
+    db = mongo_client1[database_name]
+    collection = db[chart_db_name]
+
+    existing_files = set(doc["file_name"] for doc in collection.find({}, {"file_name": 1, "_id": 0}))    
+    # Filter out files already inserted
+    file_process = [f for f in image_files if f not in existing_files]
+
+    # mdeFolder = r"C:\Users\nvd030406\Desktop\medication\BCS"
+    results = Parallel(n_jobs=parallel_process_count)(
+        delayed(process_file_parallels_1)(tif_folder,file_name,database_name, chart_db_name,chart_ocr_db_name,mdeFolder,headers,FacilityName) for file_name in tqdm(file_process, desc="Processing Images")
+     
+    )
+    # print("results",results)
+
+    stop_time = time.time()
+    print("Time taken:", round((stop_time - stat_par), 3), "seconds")  
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--input_tiff_folder", required=True)
+    parser.add_argument("--medication_page_folder")
+    parser.add_argument("--facility_name", required=True)
+    parser.add_argument("--header_file_path")
+    parser.add_argument("--database_name")
+    parser.add_argument("--chart_db_name", required=True)
+    parser.add_argument("--chart_ocr_db_name", required=True)
+    parser.add_argument("--parallel_process_count", type=int, default=1)
+    parser.add_argument("--tesseract_Path", required=True)
+    parser.add_argument("--mongo_db_con_string", required=True)
+    args = parser.parse_args()
+    main(args)
+
+
+
+main(input_tiff_folder,
+                        medication_page_folder,
+                        facility_name,
+                        header_file_path,
+                        chart_master_database_name,
+                        chart_master_coll_name,
+                        database_name,
+                        chart_db_name,
+                        chart_ocr_db_name,
+                        parallel_process_count ,
+                        tesseract_Path,
+                        mongo_db_con_string)
+
+
+# stat_par = time.time()
+# tif_folder = r"O:\For_OCR\CHART_PROCESS\R"
+
+# medFolder = r"C:\Users\nvd030406\Desktop\medication\R"
+# dbName = "R_NEW_200"
+# collName = "charts"
+# mongo_client1 = MongoClient("mongodb://172.19.19.80:27017/")
+# db1 = mongo_client1[dbName]
+# collection1 = db1[collName]
+# image_files = [f for f in os.listdir(tif_folder) if f.lower().endswith((".tiff", ".tif", ".png"))]
+# file_process=image_files
+# existing_files = set(doc["file_name"] for doc in collection1.find({}, {"file_name": 1, "_id": 0}))
+# excel_path = r"O:\From_DataScientists\Data Extraction\Main_Headers\LMC_Headers.xlsx"
+# headers = load_headers_from_excel(excel_path)
+# # Filter out files already inserted
+# file_process = [f for f in image_files if f not in existing_files]
+
+# file_process = file_process[:1]
+# results = Parallel(n_jobs=3)(
+#     delayed(process_file_parallels_1)(file_name,medFolder,headers,dbName,collName) for file_name in tqdm(file_process, desc="Processing Images")
+# )
+# # print("results",results)
+
+# stop_time = time.time()
+# print("Time taken:", round((stop_time - stat_par), 3), "seconds")
